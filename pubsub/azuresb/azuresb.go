@@ -65,6 +65,7 @@ import (
 	"time"
 
 	common "github.com/Azure/azure-amqp-common-go/v2"
+	"github.com/Azure/azure-amqp-common-go/v2/auth"
 	"github.com/Azure/azure-amqp-common-go/v2/cbs"
 	"github.com/Azure/azure-amqp-common-go/v2/rpc"
 	"github.com/Azure/azure-amqp-common-go/v2/uuid"
@@ -328,8 +329,11 @@ type subscription struct {
 	sbSub *servicebus.Subscription
 	opts  *SubscriptionOptions
 
-	linkErr  error     // saved error for initializing amqpLink
-	amqpLink *rpc.Link // nil if linkErr != nil
+	//This should have a mutex now
+	linkErr error // saved error for initializing amqpLink
+	//This should have a mutex now
+	amqpLink   *rpc.Link // nil if linkErr != nil
+	cancelFunc context.CancelFunc
 }
 
 // SubscriptionOptions will contain configuration for subscriptions.
@@ -384,6 +388,7 @@ func openSubscription(ctx context.Context, sbNs *servicebus.Namespace, sbTop *se
 	}
 	entityPath := sbTop.Name + "/Subscriptions/" + sbSub.Name
 	audience := host + entityPath
+	//todo should factor out the claim stuff so it is not repeated...
 	if err = cbs.NegotiateClaim(ctx, audience, amqpClient, sbNs.TokenProvider); err != nil {
 		sub.linkErr = fmt.Errorf("failed to negotiate claim with AMQP: %v", err)
 		return sub, nil
@@ -394,7 +399,37 @@ func openSubscription(ctx context.Context, sbNs *servicebus.Namespace, sbTop *se
 		return sub, nil
 	}
 	sub.amqpLink = link
+	cancelCtx, cancelFunc := context.WithCancel(ctx)
+	sub.cancelFunc = cancelFunc
+	sub.periodicallyRefreshClaimandLink(cancelCtx, audience, amqpClient)
 	return sub, nil
+}
+
+//TODO this is full of concurrency issues....
+func (s *subscription) periodicallyRefreshClaimandLink(ctx context.Context, audience string, client *amqp.Client) {
+	go func(ctx context.Context, audience string, client *amqp.Client, tokenProvider auth.TokenProvider, managementPath string) {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				time.Sleep(5 * time.Minute)
+				if err := cbs.NegotiateClaim(ctx, audience, client, tokenProvider); err != nil {
+					//Should get a mutex around this....
+					s.linkErr = fmt.Errorf("failed to negotiate claim with AMQP: %v", err)
+					return
+				}
+				link, err := rpc.NewLink(client, managementPath)
+				if err != nil {
+					//Should get a mutex around this....
+					s.linkErr = fmt.Errorf("failed to create link to AMQP %s: %v", managementPath, err)
+					return
+				}
+				//Should get a mutex around this....
+				s.amqpLink = link
+			}
+		}
+	}(ctx, audience, client, s.sbSub.Namespace().TokenProvider, s.sbSub.ManagementPath())
 }
 
 // IsRetryable implements driver.Subscription.IsRetryable.
@@ -645,4 +680,7 @@ func errorCode(err error) gcerrors.ErrorCode {
 }
 
 // Close implements driver.Subscription.Close.
-func (*subscription) Close() error { return nil }
+func (s *subscription) Close() error {
+	s.cancelFunc()
+	return nil
+}

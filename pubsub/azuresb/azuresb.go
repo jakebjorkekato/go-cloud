@@ -568,32 +568,33 @@ func (s *subscription) updateMessageDispositionsInPartition(ctx context.Context,
 		return nil
 	}
 
-	if errs, ok := err.(servicebus.BatchDispositionError); ok {
-		retryTokens := tokensToRetry(errs)
-		if len(retryTokens) == 0 { //could reverse this logic....
-			return nil
-		}
-		//preserve existing functionality to retry one at a time
-		//could retry the whole batch and keep trying but I don't know
-		//if that is worth it (decent amount of repeated code that can be cleaned up)
-		for _, token := range retryTokens {
-			iterator := servicebus.BatchDispositionIterator{LockTokenIDs: []*uuid.UUID{token}, Status: servicebus.MessageStatus(disposition)}
-			disposeError := s.sbSub.SendBatchDisposition(ctx, iterator)
-			if disposeError != nil {
-				if errs, ok := disposeError.(servicebus.BatchDispositionError); ok {
-					errTokens := tokensToRetry(errs)
-					if len(errTokens) != 0 {
-						return disposeError
-					}
-				} else {
-					//should not happen...
-					return disposeError
-				}
-			}
-		}
-	} else {
+	errs, ok := err.(servicebus.BatchDispositionError)
+	if !ok {
 		//this should not happen so just return out
 		return err
+	}
+
+	retryTokens := tokensToRetry(errs)
+	if len(retryTokens) == 0 { //could reverse this logic....
+		return nil
+	}
+	//preserve existing functionality to retry one at a time
+	//could retry the whole batch and keep trying but I don't know
+	//if that is worth it (decent amount of repeated code that can be cleaned up)
+	for _, token := range retryTokens {
+		iterator := servicebus.BatchDispositionIterator{LockTokenIDs: []*uuid.UUID{token}, Status: servicebus.MessageStatus(disposition)}
+		disposeError := s.sbSub.SendBatchDisposition(ctx, iterator)
+		if disposeError != nil {
+			if errs, ok := disposeError.(servicebus.BatchDispositionError); ok {
+				errTokens := tokensToRetry(errs)
+				if len(errTokens) != 0 {
+					return disposeError
+				}
+			} else {
+				//should not happen...
+				return disposeError
+			}
+		}
 	}
 
 	return nil

@@ -540,40 +540,37 @@ func (s *subscription) updateMessageDispositionsInPartition(ctx context.Context,
 		return err
 	}
 
-	retryTokens := tokensToRetry(errs)
-	if len(retryTokens) == 0 { //could reverse this logic....
-		return nil
-	}
-	//preserve existing functionality to retry one at a time
-	//could retry the whole batch and keep trying but I don't know
-	//if that is worth it (decent amount of repeated code that can be cleaned up)
-	for _, token := range retryTokens {
-		iterator := servicebus.BatchDispositionIterator{LockTokenIDs: []*uuid.UUID{token}, Status: servicebus.MessageStatus(disposition)}
-		disposeError := s.sbSub.SendBatchDisposition(ctx, iterator)
-		if disposeError != nil {
-			if errs, ok := disposeError.(servicebus.BatchDispositionError); ok {
-				errTokens := tokensToRetry(errs)
-				if len(errTokens) != 0 {
-					return disposeError
-				}
-			} else {
-				//should not happen...
-				return disposeError
-			}
-		}
-	}
-
-	return nil
+	//Just letting the library implement the retry...we can just return out the errors...
+	return formatBatchError(errs)
 }
 
-func tokensToRetry(errs servicebus.BatchDispositionError) []*uuid.UUID {
-	var tokens []*uuid.UUID
-	for _, dispoErr := range errs.Errors {
-		if !isNotFoundErr(dispoErr.UnWrap()) {
-			tokens = append(tokens, dispoErr.LockTokenID)
+//currently this error object only tells you how many errors
+//were received.  This function creates s string around the number
+//of errors, what the IDs were and the error message, ignoring not
+//found errors
+func formatBatchError(errs servicebus.BatchDispositionError) error {
+	actualErrs := errorsToReturn(errs)
+	if len(actualErrs.Errors) == 0 {
+		return nil
+	}
+
+	message := errs.Error() + "\n"
+	for _, err := range actualErrs.Errors {
+		strings.Join([]string{fmt.Sprintf("ID:  %v", err.LockTokenID), err.Error()}, ",")
+	}
+
+	return fmt.Errorf(message)
+}
+
+//Ignore not found errors
+func errorsToReturn(errs servicebus.BatchDispositionError) servicebus.BatchDispositionError {
+	var returnErrs servicebus.BatchDispositionError
+	for _, err := range errs.Errors {
+		if !isNotFoundErr(err.UnWrap()) {
+			returnErrs.Errors = append(returnErrs.Errors, err)
 		}
 	}
-	return tokens
+	return returnErrs
 }
 
 // isNotFoundErr returns true if the error is status code 410, Gone.

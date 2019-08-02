@@ -388,6 +388,7 @@ func openSubscription(ctx context.Context, sbNs *servicebus.Namespace, sbTop *se
 	}
 	entityPath := sbTop.Name + "/Subscriptions/" + sbSub.Name
 	audience := host + entityPath
+	//todo should factor out the claim stuff so it is not repeated...
 	if err = cbs.NegotiateClaim(ctx, audience, amqpClient, sbNs.TokenProvider); err != nil {
 		sub.linkErr = fmt.Errorf("failed to negotiate claim with AMQP: %v", err)
 		return sub, nil

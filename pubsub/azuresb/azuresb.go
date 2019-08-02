@@ -540,6 +540,13 @@ func (s *subscription) updateMessageDispositionsInPartition(ctx context.Context,
 		return err
 	}
 
+	//the Microsoft service bus library created a zero value object and returns it
+	//rather than returning nil so we have to validate that there are no errors present
+	//https://github.com/Azure/azure-service-bus-go/blob/master/batch_disposition.go#L69
+	if len(errs.Errors) == 0 {
+		return nil
+	}
+
 	//Just letting the library implement the retry...we can just return out the errors...
 	return formatBatchError(errs)
 }
@@ -556,7 +563,7 @@ func formatBatchError(errs servicebus.BatchDispositionError) error {
 
 	message := errs.Error() + "\n"
 	for _, err := range actualErrs.Errors {
-		strings.Join([]string{fmt.Sprintf("ID:  %v", err.LockTokenID), err.Error()}, ",")
+		message = strings.Join([]string{message, fmt.Sprintf("ID:  %+v", err.LockTokenID), fmt.Sprintf("Error:  %v", err),"\n"}, ",")
 	}
 
 	return fmt.Errorf(message)

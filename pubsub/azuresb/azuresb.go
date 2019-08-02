@@ -562,42 +562,94 @@ func (s *subscription) updateMessageDispositions(ctx context.Context, ids []driv
 // updateMessageDispositionsInPartition assumes lockTokens are all from the
 // same AzureSB partition.
 func (s *subscription) updateMessageDispositionsInPartition(ctx context.Context, lockTokens []amqp.UUID, disposition string) error {
-	value := map[string]interface{}{
-		"disposition-status": disposition,
-		"lock-tokens":        lockTokens,
-	}
-	msg := &amqp.Message{
-		ApplicationProperties: map[string]interface{}{
-			"operation": "com.microsoft:update-disposition",
-		},
-		Value: value,
+	//proof of concept
+	tokens := make([]*uuid.UUID, len(lockTokens))
+	for i, id := range lockTokens {
+		t := uuid.UUID(id)
+		tokens[i] = &t
 	}
 
-	// We're not actually making use of link.Retryable since we're passing 1
-	// here. The portable type will retry as needed.
-	//
-	// We could just use link.RPC, but it returns a result with a status code
-	// in addition to err, and we'd have to check both.
-	_, err := s.amqpLink.RetryableRPC(ctx, 1, 0, msg)
+	iter := servicebus.BatchDispositionIterator{LockTokenIDs: tokens, Status: servicebus.MessageStatus(disposition)}
+	err := s.sbSub.SendBatchDisposition(ctx, iter)
 	if err == nil {
 		return nil
 	}
-	if !isNotFoundErr(err) {
+
+	if errs, ok := err.(servicebus.BatchDispositionError); ok {
+		retryTokens := tokensToRetry(errs)
+		if len(retryTokens) == 0 { //could reverse this logic....
+			return nil
+		}
+		//preserve existing functionality to retry one at a time
+		//could retry the whole batch and keep trying but I don't know
+		//if that is worth it (decent amount of repeated code that can be cleaned up)
+		for _, token := range retryTokens {
+			iterator := servicebus.BatchDispositionIterator{LockTokenIDs: []*uuid.UUID{token}, Status: servicebus.MessageStatus(disposition)}
+			disposeError := s.sbSub.SendBatchDisposition(ctx, iterator)
+			if disposeError != nil {
+				if errs, ok := disposeError.(servicebus.BatchDispositionError); ok {
+					errTokens := tokensToRetry(errs)
+					if len(errTokens) != 0 {
+						return disposeError
+					}
+				} else {
+					//should not happen...
+					return disposeError
+				}
+			}
+		}
+	} else {
+		//this should not happen so just return out
 		return err
 	}
-	// It's a "not found" error, probably due to the message already being
-	// deleted on the server. If we're just acking 1 message, we can just
-	// swallow the error, but otherwise we'll need to retry one by one.
-	if len(lockTokens) == 1 {
-		return nil
-	}
-	for _, lockToken := range lockTokens {
-		value["lock-tokens"] = []amqp.UUID{lockToken}
-		if _, err := s.amqpLink.RetryableRPC(ctx, 1, 0, msg); err != nil && !isNotFoundErr(err) {
-			return err
+
+	return nil
+	// value := map[string]interface{}{
+	// 	"disposition-status": disposition,
+	// 	"lock-tokens":        lockTokens,
+	// }
+	// msg := &amqp.Message{
+	// 	ApplicationProperties: map[string]interface{}{
+	// 		"operation": "com.microsoft:update-disposition",
+	// 	},
+	// 	Value: value,
+	// }
+
+	// // We're not actually making use of link.Retryable since we're passing 1
+	// // here. The portable type will retry as needed.
+	// //
+	// // We could just use link.RPC, but it returns a result with a status code
+	// // in addition to err, and we'd have to check both.
+	// _, err := s.amqpLink.RetryableRPC(ctx, 1, 0, msg)
+	// if err == nil {
+	// 	return nil
+	// }
+	// if !isNotFoundErr(err) {
+	// 	return err
+	// }
+	// // It's a "not found" error, probably due to the message already being
+	// // deleted on the server. If we're just acking 1 message, we can just
+	// // swallow the error, but otherwise we'll need to retry one by one.
+	// if len(lockTokens) == 1 {
+	// 	return nil
+	// }
+	// for _, lockToken := range lockTokens {
+	// 	value["lock-tokens"] = []amqp.UUID{lockToken}
+	// 	if _, err := s.amqpLink.RetryableRPC(ctx, 1, 0, msg); err != nil && !isNotFoundErr(err) {
+	// 		return err
+	// 	}
+	// }
+	// return nil
+}
+
+func tokensToRetry(errs servicebus.BatchDispositionError) []*uuid.UUID {
+	var tokens []*uuid.UUID
+	for _, dispoErr := range errs.Errors {
+		if !isNotFoundErr(dispoErr.UnWrap()) {
+			tokens = append(tokens, dispoErr.LockTokenID)
 		}
 	}
-	return nil
+	return tokens
 }
 
 // isNotFoundErr returns true if the error is status code 410, Gone.

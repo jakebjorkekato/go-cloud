@@ -59,19 +59,15 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	common "github.com/Azure/azure-amqp-common-go/v2"
-	"github.com/Azure/azure-amqp-common-go/v2/cbs"
-	"github.com/Azure/azure-amqp-common-go/v2/rpc"
 	"github.com/Azure/azure-amqp-common-go/v2/uuid"
 	servicebus "github.com/Azure/azure-service-bus-go"
 	"gocloud.dev/gcerrors"
 	"gocloud.dev/internal/batcher"
-	"gocloud.dev/internal/useragent"
 	"gocloud.dev/pubsub"
 	"gocloud.dev/pubsub/driver"
 	"pack.ag/amqp"
@@ -327,9 +323,6 @@ func (*topic) Close() error { return nil }
 type subscription struct {
 	sbSub *servicebus.Subscription
 	opts  *SubscriptionOptions
-
-	linkErr  error     // saved error for initializing amqpLink
-	amqpLink *rpc.Link // nil if linkErr != nil
 }
 
 // SubscriptionOptions will contain configuration for subscriptions.
@@ -366,34 +359,34 @@ func openSubscription(ctx context.Context, sbNs *servicebus.Namespace, sbTop *se
 	}
 	sub := &subscription{sbSub: sbSub, opts: opts}
 
-	// Initialize a link to the AMQP server, but save any errors to be
-	// returned in ReceiveBatch instead of returning them here, because we
-	// want "subscription not found" to be a Receive time error.
-	host := fmt.Sprintf("amqps://%s.%s/", sbNs.Name, sbNs.Environment.ServiceBusEndpointSuffix)
-	amqpClient, err := amqp.Dial(host,
-		amqp.ConnSASLAnonymous(),
-		amqp.ConnProperty("product", "Go-Cloud Client"),
-		amqp.ConnProperty("version", servicebus.Version),
-		amqp.ConnProperty("platform", runtime.GOOS),
-		amqp.ConnProperty("framework", runtime.Version()),
-		amqp.ConnProperty("user-agent", useragent.AzureUserAgentPrefix("pubsub")),
-	)
-	if err != nil {
-		sub.linkErr = fmt.Errorf("failed to dial AMQP: %v", err)
-		return sub, nil
-	}
-	entityPath := sbTop.Name + "/Subscriptions/" + sbSub.Name
-	audience := host + entityPath
-	if err = cbs.NegotiateClaim(ctx, audience, amqpClient, sbNs.TokenProvider); err != nil {
-		sub.linkErr = fmt.Errorf("failed to negotiate claim with AMQP: %v", err)
-		return sub, nil
-	}
-	link, err := rpc.NewLink(amqpClient, sbSub.ManagementPath())
-	if err != nil {
-		sub.linkErr = fmt.Errorf("failed to create link to AMQP %s: %v", sbSub.ManagementPath(), err)
-		return sub, nil
-	}
-	sub.amqpLink = link
+	// // Initialize a link to the AMQP server, but save any errors to be
+	// // returned in ReceiveBatch instead of returning them here, because we
+	// // want "subscription not found" to be a Receive time error.
+	// host := fmt.Sprintf("amqps://%s.%s/", sbNs.Name, sbNs.Environment.ServiceBusEndpointSuffix)
+	// amqpClient, err := amqp.Dial(host,
+	// 	amqp.ConnSASLAnonymous(),
+	// 	amqp.ConnProperty("product", "Go-Cloud Client"),
+	// 	amqp.ConnProperty("version", servicebus.Version),
+	// 	amqp.ConnProperty("platform", runtime.GOOS),
+	// 	amqp.ConnProperty("framework", runtime.Version()),
+	// 	amqp.ConnProperty("user-agent", useragent.AzureUserAgentPrefix("pubsub")),
+	// )
+	// if err != nil {
+	// 	sub.linkErr = fmt.Errorf("failed to dial AMQP: %v", err)
+	// 	return sub, nil
+	// }
+	// entityPath := sbTop.Name + "/Subscriptions/" + sbSub.Name
+	// audience := host + entityPath
+	// if err = cbs.NegotiateClaim(ctx, audience, amqpClient, sbNs.TokenProvider); err != nil {
+	// 	sub.linkErr = fmt.Errorf("failed to negotiate claim with AMQP: %v", err)
+	// 	return sub, nil
+	// }
+	// link, err := rpc.NewLink(amqpClient, sbSub.ManagementPath())
+	// if err != nil {
+	// 	sub.linkErr = fmt.Errorf("failed to create link to AMQP %s: %v", sbSub.ManagementPath(), err)
+	// 	return sub, nil
+	// }
+	// sub.amqpLink = link
 	return sub, nil
 }
 
@@ -436,9 +429,9 @@ type partitionAckID struct {
 
 // ReceiveBatch implements driver.Subscription.ReceiveBatch.
 func (s *subscription) ReceiveBatch(ctx context.Context, maxMessages int) ([]*driver.Message, error) {
-	if s.linkErr != nil {
-		return nil, s.linkErr
-	}
+	// if s.linkErr != nil {
+	// 	return nil, s.linkErr
+	// }
 
 	rctx, cancel := context.WithTimeout(ctx, listenerTimeout)
 	defer cancel()

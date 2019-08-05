@@ -59,19 +59,15 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	common "github.com/Azure/azure-amqp-common-go/v2"
-	"github.com/Azure/azure-amqp-common-go/v2/cbs"
-	"github.com/Azure/azure-amqp-common-go/v2/rpc"
 	"github.com/Azure/azure-amqp-common-go/v2/uuid"
 	servicebus "github.com/Azure/azure-service-bus-go"
 	"gocloud.dev/gcerrors"
 	"gocloud.dev/internal/batcher"
-	"gocloud.dev/internal/useragent"
 	"gocloud.dev/pubsub"
 	"gocloud.dev/pubsub/driver"
 	"pack.ag/amqp"
@@ -327,9 +323,6 @@ func (*topic) Close() error { return nil }
 type subscription struct {
 	sbSub *servicebus.Subscription
 	opts  *SubscriptionOptions
-
-	linkErr  error     // saved error for initializing amqpLink
-	amqpLink *rpc.Link // nil if linkErr != nil
 }
 
 // SubscriptionOptions will contain configuration for subscriptions.
@@ -364,37 +357,7 @@ func openSubscription(ctx context.Context, sbNs *servicebus.Namespace, sbTop *se
 	if opts == nil {
 		opts = &SubscriptionOptions{}
 	}
-	sub := &subscription{sbSub: sbSub, opts: opts}
-
-	// Initialize a link to the AMQP server, but save any errors to be
-	// returned in ReceiveBatch instead of returning them here, because we
-	// want "subscription not found" to be a Receive time error.
-	host := fmt.Sprintf("amqps://%s.%s/", sbNs.Name, sbNs.Environment.ServiceBusEndpointSuffix)
-	amqpClient, err := amqp.Dial(host,
-		amqp.ConnSASLAnonymous(),
-		amqp.ConnProperty("product", "Go-Cloud Client"),
-		amqp.ConnProperty("version", servicebus.Version),
-		amqp.ConnProperty("platform", runtime.GOOS),
-		amqp.ConnProperty("framework", runtime.Version()),
-		amqp.ConnProperty("user-agent", useragent.AzureUserAgentPrefix("pubsub")),
-	)
-	if err != nil {
-		sub.linkErr = fmt.Errorf("failed to dial AMQP: %v", err)
-		return sub, nil
-	}
-	entityPath := sbTop.Name + "/Subscriptions/" + sbSub.Name
-	audience := host + entityPath
-	if err = cbs.NegotiateClaim(ctx, audience, amqpClient, sbNs.TokenProvider); err != nil {
-		sub.linkErr = fmt.Errorf("failed to negotiate claim with AMQP: %v", err)
-		return sub, nil
-	}
-	link, err := rpc.NewLink(amqpClient, sbSub.ManagementPath())
-	if err != nil {
-		sub.linkErr = fmt.Errorf("failed to create link to AMQP %s: %v", sbSub.ManagementPath(), err)
-		return sub, nil
-	}
-	sub.amqpLink = link
-	return sub, nil
+	return &subscription{sbSub: sbSub, opts: opts}, nil
 }
 
 // IsRetryable implements driver.Subscription.IsRetryable.
@@ -436,10 +399,6 @@ type partitionAckID struct {
 
 // ReceiveBatch implements driver.Subscription.ReceiveBatch.
 func (s *subscription) ReceiveBatch(ctx context.Context, maxMessages int) ([]*driver.Message, error) {
-	if s.linkErr != nil {
-		return nil, s.linkErr
-	}
-
 	rctx, cancel := context.WithTimeout(ctx, listenerTimeout)
 	defer cancel()
 	var messages []*driver.Message
@@ -562,42 +521,63 @@ func (s *subscription) updateMessageDispositions(ctx context.Context, ids []driv
 // updateMessageDispositionsInPartition assumes lockTokens are all from the
 // same AzureSB partition.
 func (s *subscription) updateMessageDispositionsInPartition(ctx context.Context, lockTokens []amqp.UUID, disposition string) error {
-	value := map[string]interface{}{
-		"disposition-status": disposition,
-		"lock-tokens":        lockTokens,
-	}
-	msg := &amqp.Message{
-		ApplicationProperties: map[string]interface{}{
-			"operation": "com.microsoft:update-disposition",
-		},
-		Value: value,
+	//proof of concept
+	tokens := make([]*uuid.UUID, len(lockTokens))
+	for i, id := range lockTokens {
+		t := uuid.UUID(id)
+		tokens[i] = &t
 	}
 
-	// We're not actually making use of link.Retryable since we're passing 1
-	// here. The portable type will retry as needed.
-	//
-	// We could just use link.RPC, but it returns a result with a status code
-	// in addition to err, and we'd have to check both.
-	_, err := s.amqpLink.RetryableRPC(ctx, 1, 0, msg)
+	iter := servicebus.BatchDispositionIterator{LockTokenIDs: tokens, Status: servicebus.MessageStatus(disposition)}
+	err := s.sbSub.SendBatchDisposition(ctx, iter)
 	if err == nil {
 		return nil
 	}
-	if !isNotFoundErr(err) {
+
+	errs, ok := err.(servicebus.BatchDispositionError)
+	if !ok {
+		//this should not happen so just return out
 		return err
 	}
-	// It's a "not found" error, probably due to the message already being
-	// deleted on the server. If we're just acking 1 message, we can just
-	// swallow the error, but otherwise we'll need to retry one by one.
-	if len(lockTokens) == 1 {
+
+	//the Microsoft service bus library created a zero value object and returns it
+	//rather than returning nil so we have to validate that there are no errors present
+	//https://github.com/Azure/azure-service-bus-go/blob/master/batch_disposition.go#L69
+	if len(errs.Errors) == 0 {
 		return nil
 	}
-	for _, lockToken := range lockTokens {
-		value["lock-tokens"] = []amqp.UUID{lockToken}
-		if _, err := s.amqpLink.RetryableRPC(ctx, 1, 0, msg); err != nil && !isNotFoundErr(err) {
-			return err
+
+	//Just letting the library implement the retry...we can just return out the errors...
+	return formatBatchError(errs)
+}
+
+//currently this error object only tells you how many errors
+//were received.  This function creates s string around the number
+//of errors, what the IDs were and the error message, ignoring not
+//found errors
+func formatBatchError(errs servicebus.BatchDispositionError) error {
+	actualErrs := errorsToReturn(errs)
+	if len(actualErrs.Errors) == 0 {
+		return nil
+	}
+
+	message := errs.Error() + "\n"
+	for _, err := range actualErrs.Errors {
+		message = strings.Join([]string{message, fmt.Sprintf("ID:  %+v", err.LockTokenID), fmt.Sprintf("Error:  %v", err),"\n"}, ",")
+	}
+
+	return fmt.Errorf(message)
+}
+
+//Ignore not found errors
+func errorsToReturn(errs servicebus.BatchDispositionError) servicebus.BatchDispositionError {
+	var returnErrs servicebus.BatchDispositionError
+	for _, err := range errs.Errors {
+		if !isNotFoundErr(err.UnWrap()) {
+			returnErrs.Errors = append(returnErrs.Errors, err)
 		}
 	}
-	return nil
+	return returnErrs
 }
 
 // isNotFoundErr returns true if the error is status code 410, Gone.
